@@ -1,4 +1,4 @@
-import os, base64, sqlite3, json
+import os, base64, sqlite3, json, csv, io, re, difflib
 from datetime import datetime, timezone
 from typing import Any
 import httpx
@@ -93,6 +93,87 @@ async def company_record(company_number: str):
 async def filing_document(company_number: str, document_id: str):
     # Filing document content is served by the separate Companies House document API.
     return {"message":"Document retrieval is not included in Phase 1; filing metadata and official document links are returned in the filing history.","company_number":company_number,"document_id":document_id}
+
+
+UKSL_CSV_URL = "https://sanctionslist.fcdo.gov.uk/docs/UK-Sanctions-List.csv"
+
+def sanctions_db():
+    con=db()
+    con.execute("CREATE TABLE IF NOT EXISTS uk_sanctions (uid TEXT PRIMARY KEY, names_json TEXT NOT NULL, data_json TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS sanctions_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    return con
+
+@app.get("/api/sanctions/status")
+async def sanctions_status():
+    con=sanctions_db()
+    count=con.execute("SELECT COUNT(*) FROM uk_sanctions").fetchone()[0]
+    row=con.execute("SELECT value FROM sanctions_meta WHERE key='refreshed_at'").fetchone()
+    con.close()
+    return {"source":"UK Sanctions List (FCDO)","entries_loaded":count,"refreshed_at":row[0] if row else None,"source_url":UKSL_CSV_URL}
+
+@app.post("/api/sanctions/refresh")
+async def sanctions_refresh():
+    # Download only from the official FCDO static CSV URL.
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        r=await client.get(UKSL_CSV_URL,headers={"User-Agent":"SportingIntelligenceDemo/0.1"})
+    if r.status_code != 200:
+        raise HTTPException(502,f"FCDO UK Sanctions List download failed (HTTP {r.status_code}). Existing cached list, if any, has been retained.")
+    try:
+        textdata=r.content.decode('utf-8-sig')
+        reader=csv.DictReader(io.StringIO(textdata))
+        if not reader.fieldnames: raise ValueError("CSV header row missing")
+        rows=[]
+        for idx,row in enumerate(reader):
+            clean={str(k or '').strip():str(v or '').strip() for k,v in row.items() if k}
+            name_fields=[k for k in clean if re.search(r'name|alias|aka|former|spelling',k,re.I)]
+            names=[]
+            for k in name_fields:
+                v=clean.get(k,'')
+                if v and v.lower() not in ('na','n/a','none','-'): names.append(v)
+            if not names:
+                # Fallback for variations in published CSV headers: retain non-ID fields that look like person/entity names.
+                for k,v in clean.items():
+                    if v and not re.search(r'id|date|regime|type|reference|address|passport|nationality|dob|birth|country|designation|reason|sanction|unique',k,re.I) and len(v)>2:
+                        names.append(v)
+            if not names: continue
+            uid=next((v for k,v in clean.items() if re.search(r'unique.*id|^id$|group.*id',k,re.I) and v),str(idx))
+            rows.append((uid,json.dumps(list(dict.fromkeys(names))),json.dumps(clean)))
+        if not rows: raise ValueError("No designation names could be extracted from the CSV")
+    except Exception as e:
+        raise HTTPException(502,f"Could not parse the official UK Sanctions CSV: {e}")
+    con=sanctions_db()
+    con.execute("DELETE FROM uk_sanctions")
+    con.executemany("INSERT OR REPLACE INTO uk_sanctions(uid,names_json,data_json) VALUES(?,?,?)",rows)
+    con.execute("INSERT OR REPLACE INTO sanctions_meta(key,value) VALUES('refreshed_at',?)",(stamp(),))
+    con.execute("INSERT OR REPLACE INTO sanctions_meta(key,value) VALUES('source_url',?)",(UKSL_CSV_URL,))
+    con.commit(); con.close()
+    return {"refreshed":True,"entries_loaded":len(rows),"refreshed_at":stamp(),"source":"UK Sanctions List (FCDO)","source_url":UKSL_CSV_URL}
+
+@app.get("/api/sanctions/check")
+async def sanctions_check(q: str=Query(min_length=2), threshold: float=Query(0.84,ge=0.5,le=1.0)):
+    con=sanctions_db()
+    count=con.execute("SELECT COUNT(*) FROM uk_sanctions").fetchone()[0]
+    if not count:
+        con.close()
+        raise HTTPException(503,"UK sanctions dataset has not been loaded. Call POST /api/sanctions/refresh first.")
+    rows=con.execute("SELECT names_json,data_json FROM uk_sanctions").fetchall()
+    meta=con.execute("SELECT value FROM sanctions_meta WHERE key='refreshed_at'").fetchone()
+    con.close()
+    query=re.sub(r'[^a-z0-9 ]',' ',q.lower()); query=' '.join(query.split())
+    matches=[]
+    for names_json,data_json in rows:
+        names=json.loads(names_json); best=0; matched=''
+        for name in names:
+            candidate=re.sub(r'[^a-z0-9 ]',' ',' '.join(name.lower().split())); candidate=' '.join(candidate.split())
+            score=difflib.SequenceMatcher(None,query,candidate).ratio()
+            if query==candidate: score=1.0
+            elif query in candidate or candidate in query: score=max(score,0.90)
+            if score>best: best,matched=score,name
+        if best>=threshold:
+            data=json.loads(data_json)
+            matches.append({"matched_name":matched,"similarity":round(best,3),"record":data})
+    matches.sort(key=lambda x:x['similarity'],reverse=True)
+    return {"query":q,"source":"UK Sanctions List (FCDO)","refreshed_at":meta[0] if meta else None,"dataset_entries":count,"potential_matches":matches[:20],"match_threshold":threshold,"disclaimer":"Name similarity is a screening lead, not confirmation of identity or a confirmed sanctions hit. Review identifiers and source record before any decision."}
 
 # Serve the prototype when placed in ./static
 if os.path.isdir("static"):

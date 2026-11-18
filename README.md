@@ -42,3 +42,19 @@ Never put the key in HTML, JavaScript, a public Git repository, or a browser req
 - Search results are not automatically treated as the correct club entity: the operator chooses the matching company number.
 - The initial backend has permissive CORS for local demo convenience. Tighten allowed origins and add user authentication before external access.
 - No production-grade audit logging, persistence, role-based access or encrypted document store is included yet.
+
+## Phase 1.1 visual and UK sanctions update
+- Updated light palette: brighter neutral off-white, deeper separators, stronger navy/teal/green accents and reduced orange dominance.
+- DarkSkreen Deep Research now uses a gradient outline rather than a filled gradient.
+- Added a persistent Bloomberg-inspired dark-mode toggle in the interface (visual theme only; no separate data mode).
+- Added UK Sanctions List endpoints:
+  - `POST /api/sanctions/refresh` downloads the official FCDO CSV into the local SQLite cache.
+  - `GET /api/sanctions/status` reports dataset count and refresh time.
+  - `GET /api/sanctions/check?q=NAME` performs a name-similarity check against the cached list.
+- When the Sanctions checkbox is selected for a live company record, the UI attempts a dataset refresh if no local copy exists, then runs the name check.
+
+### Sanctions data caveats
+The dataset is the official UK Sanctions List published by FCDO, not the discontinued OFSI Consolidated List. The FCDO page says UKSL became the single source for UK sanctions designations from 28 January 2026. This implementation uses the published CSV and a basic string-similarity screen. It is a triage aid only: possible matches require analyst review against identifiers, aliases, dates of birth, addresses and the underlying designation. A no-name-match result is not a clean bill of health. Refresh the list regularly and do not use this prototype as the sole basis for compliance decisions.
+
+### Deploying this update
+Replace the files in the GitHub repository with the updated package contents and commit/push. Railway should then build and deploy from the connected repository. No additional Railway variable is required for UK sanctions; the backend downloads the public FCDO CSV when needed. For reliable persistence between deploys, attach a Railway Volume and set `DATABASE_PATH` to a file path on that mounted volume (for example `/data/sporting_intelligence.sqlite3`).
