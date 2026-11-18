@@ -58,3 +58,13 @@ The dataset is the official UK Sanctions List published by FCDO, not the discont
 
 ### Deploying this update
 Replace the files in the GitHub repository with the updated package contents and commit/push. Railway should then build and deploy from the connected repository. No additional Railway variable is required for UK sanctions; the backend downloads the public FCDO CSV when needed. For reliable persistence between deploys, attach a Railway Volume and set `DATABASE_PATH` to a file path on that mounted volume (for example `/data/sporting_intelligence.sqlite3`).
+
+
+## Phase 1.2 UI and screening fixes
+- Dark mode now forces readable near-white text on near-black surfaces, including page headings and form controls.
+- Light theme uses a cleaner, brighter neutral with stronger borders and restrained navy/teal signal colours.
+- DarkSkreen Deep Research is a compact gradient-outline control aligned with the other optional checkboxes.
+- Counterparties created manually from the portfolio/network workflow are inserted at the top of the in-memory list.
+- Full record is now an editable workspace with contact fields, analyst notes, verification notes, analyst-entered review status, Companies House refresh action, UK sanctions check action, and a transparent information-completeness dial.
+- The dial is explicitly not a creditworthiness or risk score. Its initial prototype formula gives equal weight to eight populated fields. Edits are stored in browser localStorage for the demo; they are not yet synchronised to the server database.
+- UK sanctions CSV parser now detects common delimiters and a wider set of name columns. If the FCDO URL returns a non-CSV response or changes its schema, it reports that explicitly rather than claiming no match.

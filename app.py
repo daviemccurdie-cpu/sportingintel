@@ -119,26 +119,35 @@ async def sanctions_refresh():
     if r.status_code != 200:
         raise HTTPException(502,f"FCDO UK Sanctions List download failed (HTTP {r.status_code}). Existing cached list, if any, has been retained.")
     try:
-        textdata=r.content.decode('utf-8-sig')
-        reader=csv.DictReader(io.StringIO(textdata))
+        textdata=r.content.decode('utf-8-sig',errors='replace')
+        if textdata.lstrip().lower().startswith(('<!doctype html','<html')):
+            raise ValueError("The official download returned an HTML page rather than CSV data. The FCDO download URL or access response may have changed.")
+        try:
+            dialect=csv.Sniffer().sniff(textdata[:8192], delimiters=',;\\t|')
+        except Exception:
+            dialect=csv.excel
+        reader=csv.DictReader(io.StringIO(textdata), dialect=dialect)
         if not reader.fieldnames: raise ValueError("CSV header row missing")
+        headers={str(k or '').strip().lower():str(k or '').strip() for k in reader.fieldnames}
+        name_fields=[original for lower,original in headers.items() if re.search(r'name|alias|aka|former|spelling|also known',lower)]
         rows=[]
         for idx,row in enumerate(reader):
             clean={str(k or '').strip():str(v or '').strip() for k,v in row.items() if k}
-            name_fields=[k for k in clean if re.search(r'name|alias|aka|former|spelling',k,re.I)]
             names=[]
             for k in name_fields:
                 v=clean.get(k,'')
-                if v and v.lower() not in ('na','n/a','none','-'): names.append(v)
+                if v and v.lower() not in ('na','n/a','none','-','null'): names.append(v)
+            # UKSL formats may label the primary designation in entity/person name columns.
             if not names:
-                # Fallback for variations in published CSV headers: retain non-ID fields that look like person/entity names.
                 for k,v in clean.items():
-                    if v and not re.search(r'id|date|regime|type|reference|address|passport|nationality|dob|birth|country|designation|reason|sanction|unique',k,re.I) and len(v)>2:
+                    kl=k.lower()
+                    if v and re.search(r'^(name|entity name|individual name|ship name)(?:[ _-]?\\d+)?$',kl):
                         names.append(v)
-            if not names: continue
+            if not names:
+                continue
             uid=next((v for k,v in clean.items() if re.search(r'unique.*id|^id$|group.*id',k,re.I) and v),str(idx))
-            rows.append((uid,json.dumps(list(dict.fromkeys(names))),json.dumps(clean)))
-        if not rows: raise ValueError("No designation names could be extracted from the CSV")
+            rows.append((uid+'-'+str(idx),json.dumps(list(dict.fromkeys(names))),json.dumps(clean)))
+        if not rows: raise ValueError("CSV was downloaded, but no rows with recognised designation-name columns were found. Headers received: "+", ".join(reader.fieldnames[:30]))
     except Exception as e:
         raise HTTPException(502,f"Could not parse the official UK Sanctions CSV: {e}")
     con=sanctions_db()
