@@ -2,7 +2,7 @@ import os, base64, sqlite3, json, csv, io, re, difflib
 from datetime import datetime, timezone
 from typing import Any
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -29,11 +29,16 @@ async def ch_get(path: str, params: dict | None=None):
 
 
 DB_PATH=os.getenv("DATABASE_PATH","sporting_intelligence_demo.sqlite3")
+SANCTIONS_PATH=os.getenv("SANCTIONS_DATA_PATH","uk_sanctions.csv")
+SANCTIONS_META={"loaded":False,"count":0,"filename":None,"loaded_at":None,"error":None}
 class CounterpartyIn(BaseModel):
     company_number: str
     record: dict[str, Any]
 
 def db():
+    parent=os.path.dirname(DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     con=sqlite3.connect(DB_PATH)
     con.execute("CREATE TABLE IF NOT EXISTS counterparties (company_number TEXT PRIMARY KEY, record_json TEXT NOT NULL, created_at TEXT NOT NULL)")
     return con
@@ -53,8 +58,98 @@ async def save_counterparty(payload: CounterpartyIn):
     con.commit(); con.close()
     return {"saved":True,"company_number":payload.company_number}
 
+@app.put("/api/counterparties/{company_number}")
+async def update_counterparty(company_number: str, payload: CounterpartyIn):
+    if payload.company_number != company_number:
+        raise HTTPException(400,"Company number mismatch.")
+    con=db()
+    con.execute("INSERT OR REPLACE INTO counterparties(company_number,record_json,created_at) VALUES(?,?,?)",
+      (company_number,json.dumps(payload.record),stamp()))
+    con.commit(); con.close()
+    return {"saved":True,"company_number":company_number}
+
 def stamp():
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_uk_sanctions_csv(raw: bytes):
+    try:
+        decoded=raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        decoded=raw.decode("cp1252",errors="replace")
+    # The official FCDO export starts with a report-date metadata line before its CSV header.
+    lines=decoded.splitlines()
+    if lines and lines[0].lstrip().startswith("Report Date:"):
+        decoded="\n".join(lines[1:])
+    reader=csv.DictReader(io.StringIO(decoded))
+    if not reader.fieldnames or "Unique ID" not in reader.fieldnames:
+        raise HTTPException(422,"This does not look like the official UK Sanctions List CSV: expected a 'Unique ID' column.")
+    grouped={}
+    for row in reader:
+        uid=(row.get("Unique ID") or "").strip()
+        if not uid: continue
+        rec=grouped.setdefault(uid,{"unique_id":uid,"names":[],"raw":row})
+        for i in range(1,7):
+            value=(row.get(f"Name {i}") or "").strip()
+            if value and value.lower() not in {"na","n/a","none"} and value not in rec["names"]:
+                rec["names"].append(value)
+    return decoded,list(grouped.values())
+
+def load_sanctions_csv(raw: bytes, filename: str):
+    decoded,rows=parse_uk_sanctions_csv(raw)
+    if not rows:
+        raise HTTPException(422,"No designation records with a Unique ID and name fields were found.")
+    parent=os.path.dirname(SANCTIONS_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(SANCTIONS_PATH,"w",encoding="utf-8",newline="") as f:
+        f.write(decoded)
+    SANCTIONS_META.update({"loaded":True,"count":len(rows),"filename":filename,"loaded_at":stamp(),"error":None})
+    return rows
+
+def sanctions_rows():
+    if not os.path.exists(SANCTIONS_PATH):
+        return []
+    with open(SANCTIONS_PATH,"rb") as f: raw=f.read()
+    _,rows=parse_uk_sanctions_csv(raw)
+    return rows
+
+@app.post("/api/sanctions/upload")
+async def upload_sanctions(file: UploadFile=File(...), x_sanctions_admin: str=Header(default="")):
+    expected=os.getenv("SANCTIONS_ADMIN_TOKEN","")
+    if expected and x_sanctions_admin != expected:
+        raise HTTPException(403,"Admin token required.")
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(415,"Please upload a CSV file.")
+    raw=await file.read()
+    if len(raw)>100*1024*1024: raise HTTPException(413,"CSV exceeds 100 MB.")
+    rows=load_sanctions_csv(raw,file.filename)
+    return {"loaded":True,"filename":file.filename,"designations":len(rows),"loaded_at":SANCTIONS_META["loaded_at"],"report_date":(raw.decode("utf-8-sig",errors="replace").splitlines()[0].replace("Report Date:","").strip() if raw.startswith(b"Report Date:") else None),"message":"UK sanctions dataset imported and grouped by Unique ID. Name similarity results require analyst review."}
+
+@app.get("/api/sanctions/status")
+async def sanctions_status():
+    rows=sanctions_rows()
+    return {"loaded":bool(rows),"designations":len(rows),"source":"Uploaded official UK Sanctions List CSV","message":"Dataset available" if rows else "No sanctions CSV loaded. No screening has been performed."}
+
+@app.get("/api/sanctions/check")
+async def sanctions_check(q: str | None = None, name: str | None = None):
+    subject=(q or name or "").strip()
+    if len(subject) < 2:
+        raise HTTPException(422,"Provide a name of at least two characters to screen.")
+    rows=sanctions_rows()
+    if not rows:
+        raise HTTPException(503,"No UK Sanctions List CSV is loaded. Upload the current official FCDO CSV before screening.")
+    q=re.sub(r"[^a-z0-9 ]+"," ",subject.lower()).strip()
+    matches=[]
+    for row in rows:
+        for candidate in row["names"]:
+            norm=re.sub(r"[^a-z0-9 ]+"," ",candidate.lower()).strip()
+            ratio=difflib.SequenceMatcher(None,q,norm).ratio()
+            if q==norm or (len(q)>4 and (q in norm or norm in q)) or ratio>=0.88:
+                matches.append({"matched_name":candidate,"similarity":round(ratio*100),"record":row["raw"]})
+    status="Potential matches" if matches else "No potential name matches in loaded dataset"
+    message=("Potential name match(es) found. These are not confirmed matches; verify identifiers and aliases." if matches else "No potential name matches found in the loaded dataset. This is not a clean-screen conclusion; verify spelling, aliases and identifiers.")
+    return {"query":subject,"status":status,"match_count":len(matches),"matches":matches[:20],"dataset_designations":len(rows),"source":"Uploaded UK Sanctions List CSV","message":message,"disclaimer":"Name similarity is a screening lead only, not confirmation of identity or a confirmed sanctions hit."}
 
 @app.get("/api/health")
 async def health():
@@ -94,95 +189,6 @@ async def filing_document(company_number: str, document_id: str):
     # Filing document content is served by the separate Companies House document API.
     return {"message":"Document retrieval is not included in Phase 1; filing metadata and official document links are returned in the filing history.","company_number":company_number,"document_id":document_id}
 
-
-UKSL_CSV_URL = "https://sanctionslist.fcdo.gov.uk/docs/UK-Sanctions-List.csv"
-
-def sanctions_db():
-    con=db()
-    con.execute("CREATE TABLE IF NOT EXISTS uk_sanctions (uid TEXT PRIMARY KEY, names_json TEXT NOT NULL, data_json TEXT NOT NULL)")
-    con.execute("CREATE TABLE IF NOT EXISTS sanctions_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    return con
-
-@app.get("/api/sanctions/status")
-async def sanctions_status():
-    con=sanctions_db()
-    count=con.execute("SELECT COUNT(*) FROM uk_sanctions").fetchone()[0]
-    row=con.execute("SELECT value FROM sanctions_meta WHERE key='refreshed_at'").fetchone()
-    con.close()
-    return {"source":"UK Sanctions List (FCDO)","entries_loaded":count,"refreshed_at":row[0] if row else None,"source_url":UKSL_CSV_URL}
-
-@app.post("/api/sanctions/refresh")
-async def sanctions_refresh():
-    # Download only from the official FCDO static CSV URL.
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-        r=await client.get(UKSL_CSV_URL,headers={"User-Agent":"SportingIntelligenceDemo/0.1"})
-    if r.status_code != 200:
-        raise HTTPException(502,f"FCDO UK Sanctions List download failed (HTTP {r.status_code}). Existing cached list, if any, has been retained.")
-    try:
-        textdata=r.content.decode('utf-8-sig',errors='replace')
-        if textdata.lstrip().lower().startswith(('<!doctype html','<html')):
-            raise ValueError("The official download returned an HTML page rather than CSV data. The FCDO download URL or access response may have changed.")
-        try:
-            dialect=csv.Sniffer().sniff(textdata[:8192], delimiters=',;\\t|')
-        except Exception:
-            dialect=csv.excel
-        reader=csv.DictReader(io.StringIO(textdata), dialect=dialect)
-        if not reader.fieldnames: raise ValueError("CSV header row missing")
-        headers={str(k or '').strip().lower():str(k or '').strip() for k in reader.fieldnames}
-        name_fields=[original for lower,original in headers.items() if re.search(r'name|alias|aka|former|spelling|also known',lower)]
-        rows=[]
-        for idx,row in enumerate(reader):
-            clean={str(k or '').strip():str(v or '').strip() for k,v in row.items() if k}
-            names=[]
-            for k in name_fields:
-                v=clean.get(k,'')
-                if v and v.lower() not in ('na','n/a','none','-','null'): names.append(v)
-            # UKSL formats may label the primary designation in entity/person name columns.
-            if not names:
-                for k,v in clean.items():
-                    kl=k.lower()
-                    if v and re.search(r'^(name|entity name|individual name|ship name)(?:[ _-]?\\d+)?$',kl):
-                        names.append(v)
-            if not names:
-                continue
-            uid=next((v for k,v in clean.items() if re.search(r'unique.*id|^id$|group.*id',k,re.I) and v),str(idx))
-            rows.append((uid+'-'+str(idx),json.dumps(list(dict.fromkeys(names))),json.dumps(clean)))
-        if not rows: raise ValueError("CSV was downloaded, but no rows with recognised designation-name columns were found. Headers received: "+", ".join(reader.fieldnames[:30]))
-    except Exception as e:
-        raise HTTPException(502,f"Could not parse the official UK Sanctions CSV: {e}")
-    con=sanctions_db()
-    con.execute("DELETE FROM uk_sanctions")
-    con.executemany("INSERT OR REPLACE INTO uk_sanctions(uid,names_json,data_json) VALUES(?,?,?)",rows)
-    con.execute("INSERT OR REPLACE INTO sanctions_meta(key,value) VALUES('refreshed_at',?)",(stamp(),))
-    con.execute("INSERT OR REPLACE INTO sanctions_meta(key,value) VALUES('source_url',?)",(UKSL_CSV_URL,))
-    con.commit(); con.close()
-    return {"refreshed":True,"entries_loaded":len(rows),"refreshed_at":stamp(),"source":"UK Sanctions List (FCDO)","source_url":UKSL_CSV_URL}
-
-@app.get("/api/sanctions/check")
-async def sanctions_check(q: str=Query(min_length=2), threshold: float=Query(0.84,ge=0.5,le=1.0)):
-    con=sanctions_db()
-    count=con.execute("SELECT COUNT(*) FROM uk_sanctions").fetchone()[0]
-    if not count:
-        con.close()
-        raise HTTPException(503,"UK sanctions dataset has not been loaded. Call POST /api/sanctions/refresh first.")
-    rows=con.execute("SELECT names_json,data_json FROM uk_sanctions").fetchall()
-    meta=con.execute("SELECT value FROM sanctions_meta WHERE key='refreshed_at'").fetchone()
-    con.close()
-    query=re.sub(r'[^a-z0-9 ]',' ',q.lower()); query=' '.join(query.split())
-    matches=[]
-    for names_json,data_json in rows:
-        names=json.loads(names_json); best=0; matched=''
-        for name in names:
-            candidate=re.sub(r'[^a-z0-9 ]',' ',' '.join(name.lower().split())); candidate=' '.join(candidate.split())
-            score=difflib.SequenceMatcher(None,query,candidate).ratio()
-            if query==candidate: score=1.0
-            elif query in candidate or candidate in query: score=max(score,0.90)
-            if score>best: best,matched=score,name
-        if best>=threshold:
-            data=json.loads(data_json)
-            matches.append({"matched_name":matched,"similarity":round(best,3),"record":data})
-    matches.sort(key=lambda x:x['similarity'],reverse=True)
-    return {"query":q,"source":"UK Sanctions List (FCDO)","refreshed_at":meta[0] if meta else None,"dataset_entries":count,"potential_matches":matches[:20],"match_threshold":threshold,"disclaimer":"Name similarity is a screening lead, not confirmation of identity or a confirmed sanctions hit. Review identifiers and source record before any decision."}
 
 # Serve the prototype when placed in ./static
 if os.path.isdir("static"):
