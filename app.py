@@ -108,9 +108,16 @@ def load_sanctions_csv(raw: bytes, filename: str):
     return rows
 
 def sanctions_rows():
-    if not os.path.exists(SANCTIONS_PATH):
+    # Prefer the Railway persistent-volume copy; fall back to the bundled
+    # official CSV so the demo can screen immediately after deployment.
+    source_path = SANCTIONS_PATH
+    if not os.path.exists(source_path):
+        bundled_path = os.path.join(os.path.dirname(__file__), "uk_sanctions.csv")
+        if os.path.exists(bundled_path):
+            source_path = bundled_path
+    if not os.path.exists(source_path):
         return []
-    with open(SANCTIONS_PATH,"rb") as f: raw=f.read()
+    with open(source_path,"rb") as f: raw=f.read()
     _,rows=parse_uk_sanctions_csv(raw)
     return rows
 
