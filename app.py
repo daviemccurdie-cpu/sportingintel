@@ -235,10 +235,11 @@ async def filing_document(company_number: str, document_id: str):
     return {"message":"Document retrieval is not included in Phase 1; filing metadata and official document links are returned in the filing history.","company_number":company_number,"document_id":document_id}
 
 
-# Serve the prototype when placed in ./static
-if os.path.isdir("static"):
-    @app.get("/about.html")
-async def about_page():
-    return FileResponse("static/about.html")
+# Serve the prototype from the package's static directory.
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+@app.get("/about.html")
+async def about_page():
+    return FileResponse(os.path.join(STATIC_DIR, "about.html"))
+
+app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
