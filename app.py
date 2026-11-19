@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 API_KEY=os.getenv("COMPANIES_HOUSE_API_KEY","").strip()
 CH_BASE="https://api.company-information.service.gov.uk"
-app=FastAPI(title="Sporting Intelligence Phase 1 API", version="0.1.0")
+app=FastAPI(title="Sporting Intelligence Hub API", version="2.2.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 def auth():
@@ -198,7 +198,7 @@ async def sanctions_check(q: str | None = None, name: str | None = None):
 
 @app.get("/api/health")
 async def health():
-    return {"status":"ok","companies_house_configured":bool(API_KEY),"service":"Sporting Intelligence Phase 1"}
+    return {"status":"ok","companies_house_configured":bool(API_KEY),"service":"Sporting Intelligence Hub 2.2.1"}
 
 @app.get("/api/companies/search")
 async def search_companies(q: str=Query(min_length=2), items_per_page: int=Query(10,ge=1,le=20)):

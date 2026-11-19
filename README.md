@@ -1,30 +1,58 @@
-# Sporting Intelligence — Demo release (as-is)
+# Sporting Intelligence Hub — Phase 2.2.2 deployment
 
-This release packages the reviewed Phase 2.1.1 Hub interface, the updated Why Sporting Intelligence explainer, the existing Companies House / counterparty backend, and the supplied UK Sanctions List CSV.
+This release carries forward the Phase 2.1.1 hub and the Phase 2.2 counterparty-profile improvements, with a critical generated-profile JavaScript syntax fix, a working explainer route/link, and removal of the unwanted methodology panel.
 
 ## Contents
-- `static/index.html` — reviewed Sporting Intelligence Hub interface.
-- `static/about.html` — latest approved explainer preview (v3).
-- `app.py` — existing backend, including Companies House lookup, counterparty persistence and UK sanctions screening.
-- `uk_sanctions.csv` — supplied UK Sanctions List export (report date: 17-Nov-2026).
-- `requirements.txt`, `Procfile`, `.env.example` — Railway runtime files.
+- `app.py` — FastAPI backend
+- `static/index.html` — Sporting Intelligence Hub front end (Phase 2.2.2)
+- `static/about.html` — approved Why Sporting Intelligence explainer
+- `uk_sanctions.csv` — bundled UK Sanctions List dataset fallback
+- `requirements.txt`, `Procfile` — Railway runtime configuration
 
-## Deploy to the existing Railway service
-1. Replace the contents of the connected GitHub repository with the contents of this package and commit/push to the deployment branch. Railway should then build from GitHub.
-2. Preserve the existing Railway persistent volume mounted at `/data`.
-3. Preserve / set these Railway Variables:
-   - `COMPANIES_HOUSE_API_KEY` — existing private Companies House key.
+## Deploy to Railway
+1. Back up the current GitHub repository contents before replacing them.
+2. Replace the repository contents with the contents of this ZIP (the files inside the ZIP root, not the enclosing folder).
+3. Commit and push to the branch connected to Railway.
+4. Keep the existing Railway persistent volume mounted at `/data`.
+5. Preserve the existing Railway environment variables and secret values:
    - `DATABASE_PATH=/data/sporting_intelligence.sqlite3`
    - `SANCTIONS_DATA_PATH=/data/uk_sanctions.csv`
-   - `SANCTIONS_ADMIN_TOKEN` — existing private admin token (or set a new strong secret).
-4. The sanctions screening code prefers `/data/uk_sanctions.csv`; if that file is absent, it reads the bundled `uk_sanctions.csv` in the release package. Thus the supplied list is included for the demo even if the persistent-volume copy has not yet been populated. An operator upload/refresh writes to the configured persistent-volume path.
-5. After Railway reports a successful deployment, verify `/api/health`, `/api/sanctions/status`, and the `/about.html` page.
+   - `SANCTIONS_ADMIN_TOKEN` (existing secret)
+   - `COMPANIES_HOUSE_API_KEY` (existing secret)
+6. Wait for the Railway deployment to finish, then verify:
+   - `/api/health`
+   - `/api/sanctions/status`
+   - `/about.html`
+   - `/` (main hub)
 
-## Sanctions dataset
-The bundled file is the supplied UK Sanctions List CSV, report date 17-Nov-2026. Screening results are name-similarity leads only, not confirmed matches and not a clean-screen certificate. Analysts must review identifiers, aliases and source records. This is UK-list-only name screening, not comprehensive multi-jurisdiction sanctions, PEP, adverse-media or ownership/control screening.
+Do not paste secret values into GitHub or this README. Do not remove or recreate the `/data` volume.
 
-## Demo limitations — please do not present these as live capabilities
-This is an as-is demo release, not production-ready. The front-end demonstrates workflows. Secure document storage/transfer, access controls, authentication, audit logging, encryption controls, Signicat identity verification, DocuSign e-signature, live audited-financial retrieval and AI-driven financial analysis are not implemented as live services. Companies House is connected for registry lookups only. Financial values remain blank pending verified source filings. Do not enter real confidential client data or treat the demo as a production compliance control.
+## Release checks performed
+- Python syntax compilation of `app.py`
+- FastAPI import and route registration
+- HTTP smoke tests for `/`, `/about.html`, `/api/health`, `/api/sanctions/status`
+- Counterparty API PUT/GET persistence smoke test using a temporary test database
+- UK sanctions CSV load check (6,449 designation records in the bundled dataset)
+- Main hub and explainer JavaScript syntax checks
+- Generated full-counterparty page extracted from the live `openFullRecord()` template and its JavaScript syntax-checked
+- Confirmed the generated counterparty page contains five tabs and matching pane IDs
+- Confirmed the Why SI link points to `/about.html`
+- Confirmed the unwanted “Method: fact, report, hypothesis, verification” panel is removed
 
-## Existing data and configuration
-Keep the Railway `/data` volume and existing environment variables. No database migration is included. Do not commit API keys or admin tokens.
+## Important limitations
+- This remains a demo environment, not a production compliance platform.
+- Sanctions screening is UK-list name-similarity screening. Potential matches require human identity resolution; no potential match is not a clean-screen certificate.
+- Companies House lookups require the existing API key.
+- Financial intelligence, adverse media, PEP screening and licensed data-provider integrations are not connected unless separately configured.
+- The Vault front end is illustrative; secure document exchange, identity verification, e-signature, production authentication, role-based access control, and a complete audit trail are not implemented by this package.
+- Browser-local drafts are not a substitute for shared server persistence. Saved counterparty records use the API/database.
+
+## Rollback
+If the deployment fails, roll back to the previous known-good Git commit in GitHub/Railway. Keep the persistent `/data` volume and environment variables unchanged.
+
+
+## Phase 2.2.2 — Companies House relationship hierarchy
+- Discover now renders a relationship hierarchy immediately after a live Companies House company record is selected.
+- Toggle directors/officers, PSC/shareholder disclosures, and corporate/group entities independently.
+- The graph is driven by the returned Companies House officer and PSC records; adding the selected party to Counterparties retains those registry records in its companyHouse snapshot.
+- Important: Companies House PSC data is not a complete shareholder register. Directors are not necessarily owners. Corporate PSC entries are shown as disclosed corporate control links, not assumed group subsidiaries.
