@@ -117,7 +117,9 @@ def sanctions_rows():
 @app.post("/api/sanctions/upload")
 async def upload_sanctions(file: UploadFile=File(...), x_sanctions_admin: str=Header(default="")):
     expected=os.getenv("SANCTIONS_ADMIN_TOKEN","")
-    if expected and x_sanctions_admin != expected:
+    if not expected:
+        raise HTTPException(503,"SANCTIONS_ADMIN_TOKEN is not configured. Set it in Railway Variables before importing a list.")
+    if x_sanctions_admin != expected:
         raise HTTPException(403,"Admin token required.")
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(415,"Please upload a CSV file.")
@@ -125,6 +127,27 @@ async def upload_sanctions(file: UploadFile=File(...), x_sanctions_admin: str=He
     if len(raw)>100*1024*1024: raise HTTPException(413,"CSV exceeds 100 MB.")
     rows=load_sanctions_csv(raw,file.filename)
     return {"loaded":True,"filename":file.filename,"designations":len(rows),"loaded_at":SANCTIONS_META["loaded_at"],"report_date":(raw.decode("utf-8-sig",errors="replace").splitlines()[0].replace("Report Date:","").strip() if raw.startswith(b"Report Date:") else None),"message":"UK sanctions dataset imported and grouped by Unique ID. Name similarity results require analyst review."}
+
+@app.post("/api/sanctions/refresh")
+async def refresh_sanctions():
+    """Download the current official UK Sanctions List CSV from the FCDO static URL."""
+    url="https://sanctionslist.fcdo.gov.uk/docs/UK-Sanctions-List.csv"
+    try:
+        async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
+            response=await client.get(url, headers={"User-Agent":"SportingIntelligence-SanctionsScreen/1.0"})
+        if response.status_code != 200:
+            raise HTTPException(502, f"Official FCDO download returned HTTP {response.status_code}.")
+        raw=response.content
+        if len(raw)<1000 or b"Unique ID" not in raw[:20000]:
+            raise HTTPException(502,"The downloaded file did not match the expected UK Sanctions List CSV format.")
+        rows=load_sanctions_csv(raw,"UK-Sanctions-List.csv")
+        first=raw.decode("utf-8-sig",errors="replace").splitlines()[0] if raw else ""
+        report_date=first.replace("Report Date:","").strip() if first.startswith("Report Date:") else None
+        return {"loaded":True,"filename":"UK-Sanctions-List.csv","designations":len(rows),"loaded_at":SANCTIONS_META["loaded_at"],"report_date":report_date,"source":url,"message":"Downloaded current official FCDO UK Sanctions List and indexed by Unique ID."}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502,f"Could not download the official UK Sanctions List: {exc}")
 
 @app.get("/api/sanctions/status")
 async def sanctions_status():
@@ -144,12 +167,27 @@ async def sanctions_check(q: str | None = None, name: str | None = None):
     for row in rows:
         for candidate in row["names"]:
             norm=re.sub(r"[^a-z0-9 ]+"," ",candidate.lower()).strip()
+            if len(norm) < 4:
+                continue
             ratio=difflib.SequenceMatcher(None,q,norm).ratio()
-            if q==norm or (len(q)>4 and (q in norm or norm in q)) or ratio>=0.88:
-                matches.append({"matched_name":candidate,"similarity":round(ratio*100),"record":row["raw"]})
+            q_tokens=set(q.split()); n_tokens=set(norm.split())
+            token_score=len(q_tokens & n_tokens)/max(1,len(q_tokens | n_tokens))
+            # Do not match a multi-word person to a common one-word alias such as
+            # "Vladimir". Full-name fuzzy matching requires meaningful token overlap.
+            contained=(len(q_tokens)==1 and len(n_tokens)==1 and min(len(q),len(norm))>=6 and (q in norm or norm in q))
+            strong_full_match=(len(q_tokens)>=2 and len(n_tokens)>=2 and (ratio>=0.86 or token_score>=0.80))
+            surname_alias=(len(q_tokens)>=2 and len(n_tokens)==1 and len(norm)>=7 and norm==q.split()[-1])
+            if q==norm or contained or strong_full_match or surname_alias:
+                matches.append({"matched_name":candidate,"similarity":round(max(ratio,token_score),4),"similarity_percent":round(max(ratio,token_score)*100,1),"record":row["raw"]})
+    unique=[]; seen=set()
+    for match in matches:
+        key=(match["record"].get("Unique ID"),match["matched_name"].casefold())
+        if key not in seen:
+            seen.add(key); unique.append(match)
+    matches=unique
     status="Potential matches" if matches else "No potential name matches in loaded dataset"
     message=("Potential name match(es) found. These are not confirmed matches; verify identifiers and aliases." if matches else "No potential name matches found in the loaded dataset. This is not a clean-screen conclusion; verify spelling, aliases and identifiers.")
-    return {"query":subject,"status":status,"match_count":len(matches),"matches":matches[:20],"dataset_designations":len(rows),"source":"Uploaded UK Sanctions List CSV","message":message,"disclaimer":"Name similarity is a screening lead only, not confirmation of identity or a confirmed sanctions hit."}
+    return {"query":subject,"status":status,"match_count":len(matches),"matches":matches[:20],"potential_matches":matches[:20],"refreshed_at":SANCTIONS_META.get("loaded_at"),"dataset_designations":len(rows),"source":"Uploaded UK Sanctions List CSV","message":message,"disclaimer":"Name similarity is a screening lead only, not confirmation of identity or a confirmed sanctions hit."}
 
 @app.get("/api/health")
 async def health():
@@ -192,4 +230,8 @@ async def filing_document(company_number: str, document_id: str):
 
 # Serve the prototype when placed in ./static
 if os.path.isdir("static"):
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
+    @app.get("/about.html")
+async def about_page():
+    return FileResponse("static/about.html")
+
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
